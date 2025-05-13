@@ -1,0 +1,192 @@
+from binance.client import Client
+from binance.enums import *
+from binance.exceptions import BinanceAPIException
+import os
+import time
+from dotenv import load_dotenv
+import logging
+from datetime import datetime, date
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filename='aggressive_trading_bot.log'
+)
+
+load_dotenv()
+API_KEY = os.getenv("BINANCE_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET")
+
+if not API_KEY or not API_SECRET:
+    raise ValueError("API credentials not found in .env file")
+
+client = Client(API_KEY, API_SECRET)
+
+class AggressiveTradingBot:
+    def __init__(self, symbol='BTCUSDT', initial_capital=10, daily_goal=1000):
+        self.symbol = symbol
+        self.initial_capital = initial_capital
+        self.current_capital = initial_capital
+        self.daily_goal = daily_goal
+        self.daily_profit = 0
+        self.trades_today = []
+        self.current_position = None
+        self.current_date = date.today()
+        self.check_interval = 15  # 15 seconds between checks
+        self.profit_threshold = 0.005  # 0.5% profit target per trade
+        self.stop_loss_threshold = -0.003  # 0.3% stop loss
+        self.consecutive_losses = 0
+        self.max_consecutive_losses = 3
+        
+    def calculate_quantity(self, price):
+        """Calculate quantity based on current capital and price"""
+        # Using 95% of available capital to account for fees
+        return round((self.current_capital * 0.95) / price, 6)
+
+    def get_price(self):
+        try:
+            ticker = client.get_symbol_ticker(symbol=self.symbol)
+            return float(ticker['price'])
+        except Exception as e:
+            logging.error(f"Error getting price: {e}")
+            return None
+
+    def place_market_buy(self, quantity):
+        try:
+            order = client.order_market_buy(symbol=self.symbol, quantity=quantity)
+            price = float(order['fills'][0]['price'])
+            cost = price * quantity
+            self.current_position = {
+                'side': 'BUY',
+                'price': price,
+                'quantity': quantity,
+                'time': datetime.now()
+            }
+            logging.info(f"Buy order placed: Price=${price:.2f}, Quantity={quantity}")
+            return price, cost
+        except Exception as e:
+            logging.error(f"Error placing buy order: {e}")
+            return None, None
+
+    def place_market_sell(self):
+        try:
+            quantity = self.current_position['quantity']
+            order = client.order_market_sell(symbol=self.symbol, quantity=quantity)
+            price = float(order['fills'][0]['price'])
+            revenue = price * quantity
+            
+            # Calculate profit/loss
+            entry_cost = self.current_position['price'] * quantity
+            trade_profit = revenue - entry_cost
+            profit_percentage = (price - self.current_position['price']) / self.current_position['price']
+            
+            self.daily_profit += trade_profit
+            self.current_capital += trade_profit
+            
+            # Track consecutive losses
+            if trade_profit < 0:
+                self.consecutive_losses += 1
+            else:
+                self.consecutive_losses = 0
+            
+            self.trades_today.append({
+                'entry': self.current_position['price'],
+                'exit': price,
+                'profit': trade_profit,
+                'profit_percentage': profit_percentage * 100,
+                'time': datetime.now()
+            })
+            
+            self.current_position = None
+            return price, revenue
+        except Exception as e:
+            logging.error(f"Error placing sell order: {e}")
+            return None, None
+
+    def should_trade(self):
+        if self.consecutive_losses >= self.max_consecutive_losses:
+            print("Maximum consecutive losses reached. Taking a break...")
+            return False
+        if self.current_capital < 5:  # Minimum capital threshold
+            print("Capital too low to continue trading")
+            return False
+        return True
+
+    def print_status(self):
+        print("\n=== Current Status ===")
+        print(f"Capital: ${self.current_capital:.2f}")
+        print(f"Daily Profit: ${self.daily_profit:.2f}")
+        print(f"Progress to Goal: {(self.daily_profit/self.daily_goal)*100:.1f}%")
+        print(f"Trades Today: {len(self.trades_today)}")
+        if self.current_position:
+            print(f"In position: Entry at ${self.current_position['price']:.2f}")
+        print("=" * 30)
+
+def main():
+    bot = AggressiveTradingBot(symbol='BTCUSDT', initial_capital=10, daily_goal=1000)
+    price_history = []
+    
+    print(f"Starting aggressive trading bot with ${bot.initial_capital} capital")
+    
+    while True:
+        try:
+            current_time = datetime.now()
+            
+            # Reset daily stats if new day
+            if current_time.date() != bot.current_date:
+                bot.print_status()
+                bot.reset_daily_stats()
+            
+            current_price = bot.get_price()
+            if not current_price:
+                time.sleep(5)
+                continue
+                
+            price_history.append(current_price)
+            if len(price_history) > 20:  # Keep last 20 price points
+                price_history.pop(0)
+            
+            # Calculate price volatility
+            if len(price_history) >= 2:
+                short_term_change = (current_price - price_history[-2]) / price_history[-2]
+                
+                if bot.should_trade():
+                    if not bot.current_position:  # Looking for entry
+                        if abs(short_term_change) >= 0.002:  # 0.2% price movement
+                            quantity = bot.calculate_quantity(current_price)
+                            print(f"\nVolatility detected! Entering position...")
+                            price, cost = bot.place_market_buy(quantity)
+                            if price:
+                                print(f"Bought at ${price:.2f}")
+                    
+                    else:  # Managing existing position
+                        entry_price = bot.current_position['price']
+                        price_change = (current_price - entry_price) / entry_price
+                        
+                        # Take profit or stop loss
+                        if price_change >= bot.profit_threshold or price_change <= bot.stop_loss_threshold:
+                            print(f"\nExiting position at ${current_price:.2f}")
+                            price, revenue = bot.place_market_sell()
+                            if price:
+                                profit = bot.trades_today[-1]['profit']
+                                print(f"Profit/Loss: ${profit:.2f}")
+                                bot.print_status()
+            
+            # Brief status update every minute
+            if current_time.second == 0:
+                bot.print_status()
+            
+            time.sleep(bot.check_interval)
+
+        except KeyboardInterrupt:
+            print("\nBot stopped by user")
+            bot.print_status()
+            break
+        except Exception as e:
+            print(f"Error: {e}")
+            logging.error(f"Main loop error: {e}")
+            time.sleep(5)
+
+if __name__ == "__main__":
+    main()
